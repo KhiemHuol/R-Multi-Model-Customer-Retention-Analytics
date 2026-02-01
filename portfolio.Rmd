@@ -1,0 +1,210 @@
+---
+title: "Untitled"
+author: "GKH"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+##############################################
+# TELECOM CHURN PREDICTION — CLEAN VERSION
+#############################################
+
+packages <- c(
+  "tidyverse", "caret", "randomForest", "xgboost",
+  "pROC", "ROCR", "recipes", "janitor"
+)
+installed <- packages %in% installed.packages()[, "Package"]
+if (any(!installed)) install.packages(packages[!installed])
+lapply(packages, library, character.only = TRUE)
+
+# --- 1. Load Data ---
+df <- read_csv("C:\\Users\\300\\Downloads\\Telco_customer_churn.csv", col_types = cols(.default = "c"))
+
+# --- 2. Clean Column Names ---
+df <- df %>% clean_names()
+
+
+# --- 3. Convert numeric columns ---
+df <- df %>%
+  mutate(
+    latitude = as.numeric(latitude),
+    longitude = as.numeric(longitude),
+    tenure_months = as.numeric(tenure_months),
+    monthly_charges = as.numeric(monthly_charges),
+    total_charges = as.numeric(total_charges),
+    cltv = as.numeric(cltv),
+    churn_value = as.integer(churn_value),
+    churn_score = as.numeric(churn_score)
+  )
+
+# Impute missing total_charges = monthly * tenure
+df <- df %>%
+  mutate(total_charges = ifelse(is.na(total_charges),
+                                tenure_months * monthly_charges,
+                                total_charges))
+
+# --- 4. Convert categorical columns to factor ---
+cat_cols <- c(
+  "gender", "senior_citizen", "partner", "dependents",
+  "phone_service", "multiple_lines", "internet_service",
+  "online_security", "online_backup", "device_protection",
+  "tech_support", "streaming_tv", "streaming_movies",
+  "contract", "paperless_billing", "payment_method",
+  "churn_label", "churn_reason"
+)
+
+cat_cols <- intersect(cat_cols, names(df))
+df <- df %>% mutate(across(all_of(cat_cols), as.factor))
+
+# --- 5. Create churn target ---
+df <- df %>%
+  mutate(churn = ifelse(tolower(churn_label) == "yes", "Yes", "No")) %>%
+  mutate(churn = factor(churn, levels = c("No", "Yes")))
+
+# --- 6. Feature Engineering ---
+
+## tenure bins
+df <- df %>%
+  mutate(tenure_group = case_when(
+    tenure_months <= 6 ~ "0-6",
+    tenure_months <= 12 ~ "7-12",
+    tenure_months <= 24 ~ "13-24",
+    tenure_months <= 48 ~ "25-48",
+    tenure_months > 48 ~ "49+",
+    TRUE ~ "unknown"
+  )) %>%
+  mutate(tenure_group = factor(tenure_group))
+
+## monthly charge high/low
+df <- df %>%
+  mutate(monthly_high = ifelse(monthly_charges > median(monthly_charges, na.rm = TRUE), 1, 0)) %>%
+  mutate(monthly_high = factor(monthly_high, labels = c("low", "high")))
+
+## total service count
+service_cols <- c(
+  "online_security", "online_backup", "device_protection",
+  "tech_support", "streaming_tv", "streaming_movies", "multiple_lines"
+)
+
+df <- df %>%
+  mutate(across(all_of(service_cols),
+                ~ ifelse(. %in% c("Yes", "yes", "TRUE", "1"), 1, 0))) %>%
+  mutate(total_services = rowSums(across(all_of(service_cols))))
+
+# --- 7. Prepare modeling dataset ---
+predictors <- c(
+  "gender", "senior_citizen", "partner", "dependents",
+  "tenure_group", "phone_service", "multiple_lines",
+  "internet_service", "total_services", "contract",
+  "paperless_billing", "payment_method", "monthly_high",
+  "tenure_months", "monthly_charges", "total_charges",
+  "latitude", "longitude"
+)
+
+predictors <- intersect(predictors, names(df))
+
+model_df <- df %>% select(all_of(predictors), churn)
+
+# --- 8. Train/Test split ---
+set.seed(123)
+train_index <- createDataPartition(model_df$churn, p = 0.8, list = FALSE)
+train <- model_df[train_index, ]
+test  <- model_df[-train_index, ]
+
+# Upsample minority class
+train_up <- upSample(x = train %>% select(-churn),
+                     y = train$churn,
+                     yname = "churn")
+
+# --- 9. Preprocessing recipe ---
+rec <- recipe(churn ~ ., data = train_up) %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>%
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  prep(training = train_up)
+
+train_baked <- bake(rec, new_data = NULL)
+test_baked  <- bake(rec, new_data = test)
+
+# X/Y matrices for models
+x_train <- train_baked %>% select(-churn) %>% as.matrix()
+y_train <- ifelse(train_baked$churn == "Yes", 1, 0)
+
+x_test <- test_baked %>% select(-churn) %>% as.matrix()
+y_test <- ifelse(test_baked$churn == "Yes", 1, 0)
+
+test_factor <- test_baked$churn
+
+# --- 10. Logistic Regression ---
+glm_mod <- glm(churn ~ ., data = train_baked, family = binomial)
+glm_prob <- predict(glm_mod, newdata = test_baked, type = "response")
+glm_pred <- factor(ifelse(glm_prob > 0.5, "Yes", "No"), levels = c("No","Yes"))
+
+conf_glm <- confusionMatrix(glm_pred, test_factor, positive = "Yes")
+glm_auc <- roc(response = test_factor, predictor = glm_prob)
+
+print(conf_glm)
+print(auc(glm_auc))
+
+# --- 11. Random Forest ---
+set.seed(100)
+rf_mod <- randomForest(churn ~ ., data = train_baked, ntree = 400, importance = TRUE)
+rf_prob <- predict(rf_mod, newdata = test_baked, type = "prob")[, "Yes"]
+rf_pred <- factor(ifelse(rf_prob > 0.5, "Yes", "No"), levels = c("No","Yes"))
+
+conf_rf <- confusionMatrix(rf_pred, test_factor, positive = "Yes")
+rf_auc <- roc(test_factor, rf_prob)
+
+print(conf_rf)
+print(auc(rf_auc))
+
+plot(rf_mod)
+
+# --- 12. XGBoost ---
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest  <- xgb.DMatrix(data = x_test, label = y_test)
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_mod <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  verbose = 0
+)
+
+xgb_prob <- predict(xgb_mod, dtest)
+xgb_pred <- factor(ifelse(xgb_prob > 0.5, "Yes", "No"), levels=c("No","Yes"))
+
+conf_xgb <- confusionMatrix(xgb_pred, test_factor, positive="Yes")
+xgb_auc <- roc(test_factor, xgb_prob)
+
+print(conf_xgb)
+print(auc(xgb_auc))
+
+# --- 13. Compare models ---
+results <- tibble(
+  model = c("Logistic", "Random Forest", "XGBoost"),
+  AUC = c(auc(glm_auc), auc(rf_auc), auc(xgb_auc)),
+  TPR = c(conf_glm$byClass["Sensitivity"],
+          conf_rf$byClass["Sensitivity"],
+          conf_xgb$byClass["Sensitivity"])
+)
+
+print(results)
+
+```
+
